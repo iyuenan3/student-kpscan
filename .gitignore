@@ -1,0 +1,31 @@
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+build/
+src-tauri/target/
+target/
+
+# 环境 / 密钥（红线：绝不提交 key）
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets.*
+
+# 测试数据 + spike 识别产物（含未成年人试卷及其转写文本，绝不入库）
+samples/
+test-data/
+错题样本/
+spike/out/
+
+# Python
+.venv/
+venv/
+__pycache__/
+
+# 系统
+.DS_Store
+*.log
