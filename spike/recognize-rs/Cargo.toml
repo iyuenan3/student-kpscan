@@ -8,6 +8,6 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
 base64 = "0.22"
+csv = "1"
 # reqwest：关掉默认（默认带 native-tls），只要 blocking 同步客户端 + json + rustls 后端。
-# rustls 后端才方便用 add_root_certificate 加载自签 CA。
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
