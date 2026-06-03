@@ -18,11 +18,9 @@
 
 ## 技术栈
 
-Tauri（Windows 桌面）+ newapi（OpenAI 兼容）vision 模型 + 本地 SQLite。
+Tauri（Rust + React，Windows 桌面）+ newapi（OpenAI 兼容）vision 模型 + 本地 SQLite。
 
 ## 目录
 
-- `AIREADME/` AI 真相源（身份 / 决策 / 架构 / 路线 / 产品意图，跨项目了解 + 防偏差；入口 `AIREADME/INDEX.md`）
-- `CLAUDE.md` 项目 onboard + 行为约束（router）
 - `knowledge/` 浙江初中数学知识点树（核心资产，v0 待考纲校准）
 - `spike/` 第 0 步识别率 spike 脚本（gating，通过才开发 MVP）

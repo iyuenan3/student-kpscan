@@ -26,6 +26,10 @@ spike/out/
 venv/
 __pycache__/
 
+# AI 文档（私有，不公开；靠本地 + Claude memory 维护，跟其他项目惯例一致）
+AIREADME/
+CLAUDE.md
+
 # 系统
 .DS_Store
 *.log
