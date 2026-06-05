@@ -1,12 +1,12 @@
 //! student-kpscan 识别率 spike 的 Rust 版（recognize-rs）。
-//! 对照 spike/recognize.py 逐步移植：check / run / score。
-//! 第五步：run 支持 --image（单图）/ --dir（批量出 review.csv），识别核心抽成 recognize_one。
+//! 对照 spike/recognize.py，并升级为「一图多题」（真实错题本一页多题，见 DECISIONS-019）。
+//! 命令：check / run --image / run --dir / score。
 #![allow(dead_code)] // KpNode.name、PointRef.name 暂未读，保留语义完整
 
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::Write; // stdout().flush()
+use std::io::Write;
 use std::path::Path;
 use std::process;
 use std::time::Instant;
@@ -75,44 +75,46 @@ struct LoadedTree {
     issues: Vec<String>,
 }
 
-// ===== 单图识别结果（recognize_one 的返回；单图打印、批量落表都用它）=====
-struct RecogResult {
+// ===== 识别结果：一张图 N 道题 =====
+/// 一道题的识别结果。
+struct Question {
+    label: String, // 图中题号（如 4 / 16 / 拓展延伸），可空
+    read_text: String,
+    has_figure: bool,
+    primary_kp_id: String,
+    primary_kp_path: String,
+    in_tree: bool,
+    alt_kp_ids: Vec<String>,
+    confidence: f64,
+    reason: String,
+}
+/// 一张图的识别结果（含它上面的所有题）。
+struct ImageResult {
     image: String,
     ok: bool,
     error: String,
     raw: String,
-    parsed: Option<serde_json::Value>,
-    primary_kp_id: String,
-    primary_kp_path: String,
-    in_tree: bool,
     latency_sec: f64,
     prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,
+    questions: Vec<Question>,
 }
 
-const SYSTEM_PROMPT_HEAD: &str = r#"你是浙江初中数学错题识别助手。我会给你一张错题图片（机器印刷体题目，可能含数学公式和几何图 / 函数图象）。请完成两件事，并且只输出一个 JSON 对象，不要写任何解释、不要用 markdown 代码块。
+// ===== system prompt：一图多题，输出 JSON 数组 =====
+const SYSTEM_PROMPT_HEAD: &str = r#"你是浙江初中数学错题识别助手。我会给你一张图，图中通常有多道数学题（错题本常一页多题）。请识别图中【每一道】题：转写题干（数学符号尽量用 Unicode：√ ² ³ △ ⊥ ∠ ° π ≤ ≥ ≠ ∽ ≌，不要用反斜杠 LaTeX 命令如 \sqrt \triangle，以免 JSON 转义出错；忽略手写笔迹 / 批改 / 答案），并从给定知识点清单选最匹配的 id。
 
-任务一，读题：转写图片中的印刷体数学题目文本。公式用 LaTeX（行内写成 $...$）。忽略手写笔迹、红叉、老师批改等非题干内容。若图中有多道题，转写最完整的一道。
+只输出一个 JSON 数组，每个元素是一道题：
+[{"题号":"图中题号如 4 / 16，没有就空","read_text":"题干，数学符号用 Unicode 不用反斜杠","has_figure":true 或 false,"primary_kp_id":"清单中真实 id","primary_kp_name":"知识点名","alt_kp_ids":["备选id"],"confidence":0 到 1 的小数,"reason":"一句话归类依据"}]
 
-任务二，归类：从下面给定的知识点清单中，选出该题最匹配的 1 个知识点 id 作为 primary_kp_id，可再给最多 2 个备选放进 alt_kp_ids。只能选清单中真实存在的 id，绝不要自造 id。尽量归到最细的「点」级 id；若把握不大，可以只给到「节」级（去掉 id 最后一段，如 8A.2.7）或「章」级（如 8A.2），并相应调低 confidence。
+只能用清单中真实存在的 id，绝不自造；尽量归到最细的「点」级，把握不大可只到「节」/「章」级并相应调低 confidence。不要写解释、不要用 markdown 代码块。
 
-输出 JSON，字段如下：
-{
-  "read_text": "转写的题目文本，公式用 LaTeX",
-  "has_figure": true 或 false,
-  "primary_kp_id": "如 8A.2.7.1",
-  "primary_kp_name": "该 id 对应的知识点名称",
-  "alt_kp_ids": ["备选id", "..."],
-  "confidence": 0 到 1 之间的小数,
-  "reason": "一句话归类依据"
-}
-
-知识点清单（格式为：id | 册 > 章 > 节 > 点）：
+知识点清单（格式 id | 册 > 章 > 节 > 点）：
 "#;
 
-const REVIEW_HEADERS: [&str; 12] = [
+const REVIEW_HEADERS: [&str; 13] = [
     "图片",
+    "题号",
     "模型读题文本",
     "含图形",
     "归类ID(主)",
@@ -277,7 +279,7 @@ fn encode_image(path: &str) -> Result<String, String> {
 fn build_client(cfg: &Config) -> Result<reqwest::blocking::Client, String> {
     let mut builder = reqwest::blocking::Client::builder()
         .no_proxy()
-        .timeout(std::time::Duration::from_secs(120));
+        .timeout(std::time::Duration::from_secs(180));
     if !cfg.ca_cert.is_empty() {
         let pem = fs::read(&cfg.ca_cert).map_err(|e| format!("读不到 CA 证书 {}：{e}", cfg.ca_cert))?;
         let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| format!("CA 证书解析失败：{e}"))?;
@@ -300,12 +302,12 @@ fn call_vision(
         "messages": [
             { "role": "system", "content": system_prompt },
             { "role": "user", "content": [
-                { "type": "text", "text": "请识别这张错题图，并按要求只输出 JSON。" },
+                { "type": "text", "text": "识别这张图里的所有题目，按要求只输出 JSON 数组。" },
                 { "type": "image_url", "image_url": { "url": data_uri, "detail": "high" } }
             ]}
         ],
         "temperature": 0,
-        "max_tokens": 1500
+        "max_tokens": 8000
     });
 
     let resp = client
@@ -333,17 +335,71 @@ fn call_vision(
     }
 }
 
-fn parse_model_json(text: &str) -> Result<serde_json::Value, String> {
-    let start = text.find('{').ok_or("输出里找不到 {")?;
-    let end = text.rfind('}').ok_or("输出里找不到 }")?;
-    if end <= start {
-        return Err("JSON 边界异常".to_string());
+/// 兜底：把 JSON 字符串里残留的非法反斜杠转义（`\` 后跟非合法转义字符，如 LaTeX 的 \s \p \( ）
+/// 改成双反斜杠，让 serde 至少能解析。prompt 已要求用 Unicode，这里只是保险。
+fn fix_json_escapes(s: &str) -> String {
+    let valid = ['"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'];
+    let mut out = String::with_capacity(s.len() + 32);
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some(&next) if valid.contains(&next) => {
+                    out.push('\\');
+                    out.push(next);
+                    chars.next();
+                }
+                _ => {
+                    out.push('\\');
+                    out.push('\\');
+                }
+            }
+        } else {
+            out.push(c);
+        }
     }
-    serde_json::from_str(&text[start..=end]).map_err(|e| format!("JSON 解析失败：{e}"))
+    out
 }
 
-/// 单图识别：编码 → 调用 → 解析 → id 校验，全部装进 RecogResult。失败也不 panic，记进 error。
-fn recognize_one(
+/// 从模型输出里抠出 JSON 数组，逐题转成 Question（含 id 校验）。
+fn parse_questions(text: &str, id_index: &HashMap<String, KpNode>) -> Result<Vec<Question>, String> {
+    let start = text.find('[').ok_or("输出里找不到 JSON 数组开头 [")?;
+    let end = text.rfind(']').ok_or("输出里找不到 ]")?;
+    if end <= start {
+        return Err("JSON 数组边界异常".to_string());
+    }
+    let slice = &text[start..=end];
+    let val: serde_json::Value = serde_json::from_str(slice)
+        .or_else(|_| serde_json::from_str(&fix_json_escapes(slice)))
+        .map_err(|e| format!("JSON 数组解析失败：{e}"))?;
+    let items = val.as_array().ok_or("解析结果不是数组")?;
+
+    let mut qs = Vec::new();
+    for it in items {
+        let pid = it["primary_kp_id"].as_str().unwrap_or("").to_string();
+        let in_tree = id_index.contains_key(&pid);
+        let path = id_index.get(&pid).map(|n| n.path.clone()).unwrap_or_default();
+        let alt: Vec<String> = it["alt_kp_ids"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        qs.push(Question {
+            label: it["题号"].as_str().unwrap_or("").to_string(),
+            read_text: it["read_text"].as_str().unwrap_or("").to_string(),
+            has_figure: it["has_figure"].as_bool().unwrap_or(false),
+            primary_kp_id: pid,
+            primary_kp_path: path,
+            in_tree,
+            alt_kp_ids: alt,
+            confidence: it["confidence"].as_f64().unwrap_or(0.0),
+            reason: it["reason"].as_str().unwrap_or("").to_string(),
+        });
+    }
+    Ok(qs)
+}
+
+/// 识别一张图（可能多题）。失败不 panic，记进 error。
+fn recognize_image(
     client: &reqwest::blocking::Client,
     endpoint: &str,
     key: &str,
@@ -351,20 +407,17 @@ fn recognize_one(
     system_prompt: &str,
     id_index: &HashMap<String, KpNode>,
     image: &str,
-) -> RecogResult {
-    let mut r = RecogResult {
+) -> ImageResult {
+    let mut r = ImageResult {
         image: image.to_string(),
         ok: false,
         error: String::new(),
         raw: String::new(),
-        parsed: None,
-        primary_kp_id: String::new(),
-        primary_kp_path: String::new(),
-        in_tree: false,
         latency_sec: 0.0,
         prompt_tokens: 0,
         completion_tokens: 0,
         total_tokens: 0,
+        questions: Vec::new(),
     };
 
     let data_uri = match encode_image(image) {
@@ -389,13 +442,9 @@ fn recognize_one(
     r.completion_tokens = usage["completion_tokens"].as_u64().unwrap_or(0);
     r.total_tokens = usage["total_tokens"].as_u64().unwrap_or(0);
 
-    match parse_model_json(&raw) {
-        Ok(p) => {
-            let pid = p["primary_kp_id"].as_str().unwrap_or("").to_string();
-            r.in_tree = id_index.contains_key(&pid);
-            r.primary_kp_path = id_index.get(&pid).map(|n| n.path.clone()).unwrap_or_default();
-            r.primary_kp_id = pid;
-            r.parsed = Some(p);
+    match parse_questions(&raw, id_index) {
+        Ok(qs) => {
+            r.questions = qs;
             r.ok = true;
         }
         Err(e) => r.error = e,
@@ -403,31 +452,26 @@ fn recognize_one(
     r
 }
 
-fn print_single(r: &RecogResult) {
-    println!("\n==== 识别结果：{} ====", r.image);
+fn print_image(r: &ImageResult) {
+    println!("\n==== {} ====", r.image);
     if !r.ok {
         println!("失败：{}", r.error);
         return;
     }
-    let p = r.parsed.as_ref().unwrap();
-    println!("读题文本：\n{}", p["read_text"].as_str().unwrap_or(""));
-    println!("\n含图形：{}", p["has_figure"]);
-    let path_show = if r.primary_kp_path.is_empty() {
-        "(不在知识点树中！)"
-    } else {
-        r.primary_kp_path.as_str()
-    };
-    println!("归类（主）：{}  {}", r.primary_kp_id, path_show);
-    println!("备选：{}", p["alt_kp_ids"]);
-    println!("置信度：{}", p["confidence"]);
-    println!("依据：{}", p["reason"].as_str().unwrap_or(""));
-    if !r.in_tree {
-        println!("⚠ primary_kp_id 不在知识点树里，可能自造，归类不可信。");
-    }
     println!(
-        "\n耗时 {:.2}s，tokens 提示 {} / 生成 {}",
-        r.latency_sec, r.prompt_tokens, r.completion_tokens
+        "识别出 {} 道题（耗时 {:.1}s，tokens {}）",
+        r.questions.len(),
+        r.latency_sec,
+        r.total_tokens
     );
+    for (i, q) in r.questions.iter().enumerate() {
+        let label = if q.label.is_empty() { "?" } else { q.label.as_str() };
+        println!("\n--- 第 {} 道（题号 {}）---", i + 1, label);
+        println!("读题：{}", q.read_text);
+        let tree_mark = if q.in_tree { "" } else { "  (不在知识点树！)" };
+        println!("归类：{}  {}{}", q.primary_kp_id, q.primary_kp_path, tree_mark);
+        println!("备选：{:?}    置信度：{:.2}", q.alt_kp_ids, q.confidence);
+    }
 }
 
 fn gather_images(dir: &str) -> Result<Vec<String>, String> {
@@ -453,41 +497,39 @@ fn gather_images(dir: &str) -> Result<Vec<String>, String> {
     Ok(imgs)
 }
 
-fn write_review_csv(results: &[RecogResult], path: &Path) -> Result<(), String> {
+fn write_review_csv(results: &[ImageResult], path: &Path) -> Result<(), String> {
     let mut wtr = csv::Writer::from_path(path).map_err(|e| format!("建 review.csv 失败：{e}"))?;
     wtr.write_record(REVIEW_HEADERS).map_err(|e| format!("写表头失败：{e}"))?;
     for r in results {
-        let row: Vec<String> = if r.ok {
-            let p = r.parsed.as_ref().unwrap();
-            let alt = p["alt_kp_ids"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" "))
-                .unwrap_or_default();
-            let pid_mark = if r.in_tree {
-                r.primary_kp_id.clone()
+        if !r.ok {
+            let mut row = vec![r.image.clone(), String::new(), format!("[识别失败] {}", r.error)];
+            row.resize(13, String::new());
+            wtr.write_record(&row).map_err(|e| format!("写行失败：{e}"))?;
+            continue;
+        }
+        for q in &r.questions {
+            let pid_mark = if q.in_tree {
+                q.primary_kp_id.clone()
             } else {
-                format!("{} (不在树中)", r.primary_kp_id)
+                format!("{} (不在树中)", q.primary_kp_id)
             };
-            vec![
+            let row = vec![
                 r.image.clone(),
-                p["read_text"].as_str().unwrap_or("").to_string(),
-                p["has_figure"].to_string(),
+                q.label.clone(),
+                q.read_text.clone(),
+                q.has_figure.to_string(),
                 pid_mark,
-                r.primary_kp_path.clone(),
-                alt,
-                p["confidence"].to_string(),
-                p["reason"].as_str().unwrap_or("").to_string(),
+                q.primary_kp_path.clone(),
+                q.alt_kp_ids.join(" "),
+                format!("{}", q.confidence),
+                q.reason.clone(),
                 String::new(),
                 String::new(),
                 String::new(),
                 String::new(),
-            ]
-        } else {
-            let mut v = vec![r.image.clone(), format!("[识别失败] {}", r.error)];
-            v.resize(12, String::new());
-            v
-        };
-        wtr.write_record(&row).map_err(|e| format!("写行失败：{e}"))?;
+            ];
+            wtr.write_record(&row).map_err(|e| format!("写行失败：{e}"))?;
+        }
     }
     wtr.flush().map_err(|e| format!("flush 失败：{e}"))?;
     Ok(())
@@ -529,7 +571,6 @@ fn cmd_check() -> Result<(), String> {
     Ok(())
 }
 
-/// 准备识别上下文（配置 / 树 / prompt / client），单图和批量都要。
 struct RunCtx {
     cfg: Config,
     loaded: LoadedTree,
@@ -556,7 +597,7 @@ fn cmd_run_image(image: &str) -> Result<(), String> {
         ctx.cfg.model,
         ctx.loaded.points.len()
     );
-    let r = recognize_one(
+    let r = recognize_image(
         &ctx.client,
         &ctx.endpoint,
         &ctx.cfg.key,
@@ -565,7 +606,7 @@ fn cmd_run_image(image: &str) -> Result<(), String> {
         &ctx.loaded.id_index,
         image,
     );
-    print_single(&r);
+    print_image(&r);
     Ok(())
 }
 
@@ -573,19 +614,19 @@ fn cmd_run_dir(dir: &str) -> Result<(), String> {
     let ctx = prepare_run()?;
     let images = gather_images(dir)?;
     println!(
-        "端点 {} | 模型 {} | 知识点 {} 个 | 待识别 {} 张",
+        "端点 {} | 模型 {} | 知识点 {} 个 | 待识别 {} 张图",
         ctx.endpoint,
         ctx.cfg.model,
         ctx.loaded.points.len(),
         images.len()
     );
 
-    let mut results: Vec<RecogResult> = Vec::new();
+    let mut results: Vec<ImageResult> = Vec::new();
     let t_start = Instant::now();
     for (i, img) in images.iter().enumerate() {
         print!("[{}/{}] {} ... ", i + 1, images.len(), img);
         std::io::stdout().flush().ok();
-        let r = recognize_one(
+        let r = recognize_image(
             &ctx.client,
             &ctx.endpoint,
             &ctx.cfg.key,
@@ -595,28 +636,34 @@ fn cmd_run_dir(dir: &str) -> Result<(), String> {
             img,
         );
         if r.ok {
-            let conf = r.parsed.as_ref().map(|p| p["confidence"].to_string()).unwrap_or_default();
-            println!("ok {:.1}s -> {}（置信度 {}）", r.latency_sec, r.primary_kp_id, conf);
+            println!("ok {:.1}s，识别 {} 道题", r.latency_sec, r.questions.len());
         } else {
             println!("失败：{}", r.error.chars().take(80).collect::<String>());
         }
         results.push(r);
     }
 
-    // 输出目录 spike/out（.gitignore 已挡，识别产物不入库）
     let out_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../out"));
     fs::create_dir_all(out_dir).map_err(|e| format!("建输出目录失败：{e}"))?;
 
     let mut jsonl = String::new();
     for r in &results {
+        let qs: Vec<serde_json::Value> = r
+            .questions
+            .iter()
+            .map(|q| {
+                serde_json::json!({
+                    "题号": q.label, "read_text": q.read_text, "has_figure": q.has_figure,
+                    "primary_kp_id": q.primary_kp_id, "primary_kp_path": q.primary_kp_path,
+                    "in_tree": q.in_tree, "alt_kp_ids": q.alt_kp_ids,
+                    "confidence": q.confidence, "reason": q.reason,
+                })
+            })
+            .collect();
         let line = serde_json::json!({
             "image": r.image, "ok": r.ok, "error": r.error,
-            "primary_kp_id": r.primary_kp_id, "in_tree": r.in_tree,
-            "latency_sec": r.latency_sec,
-            "prompt_tokens": r.prompt_tokens,
-            "completion_tokens": r.completion_tokens,
-            "total_tokens": r.total_tokens,
-            "raw": r.raw, "parsed": r.parsed,
+            "latency_sec": r.latency_sec, "total_tokens": r.total_tokens,
+            "questions": qs,
         });
         jsonl.push_str(&line.to_string());
         jsonl.push('\n');
@@ -626,28 +673,21 @@ fn cmd_run_dir(dir: &str) -> Result<(), String> {
     let review_path = out_dir.join("review.csv");
     write_review_csv(&results, &review_path)?;
 
-    let ok_n = results.iter().filter(|r| r.ok).count();
-    let fail_n = results.len() - ok_n;
-    let not_in_tree = results.iter().filter(|r| r.ok && !r.in_tree).count();
-    let has_fig = results
-        .iter()
-        .filter(|r| r.ok && r.parsed.as_ref().is_some_and(|p| p["has_figure"].as_bool().unwrap_or(false)))
-        .count();
+    let img_ok = results.iter().filter(|r| r.ok).count();
+    let img_fail = results.len() - img_ok;
+    let total_q: usize = results.iter().map(|r| r.questions.len()).sum();
+    let has_fig = results.iter().flat_map(|r| &r.questions).filter(|q| q.has_figure).count();
+    let not_in_tree = results.iter().flat_map(|r| &r.questions).filter(|q| !q.in_tree).count();
     let total_tok: u64 = results.iter().map(|r| r.total_tokens).sum();
-    let avg_lat = if ok_n > 0 {
-        results.iter().filter(|r| r.ok).map(|r| r.latency_sec).sum::<f64>() / ok_n as f64
-    } else {
-        0.0
-    };
 
     println!("\n== 批量完成（耗时 {:.0}s）==", t_start.elapsed().as_secs_f64());
-    println!("  成功 {ok_n} / 失败 {fail_n}");
-    println!("  含图形题 {has_fig}（公式 / 几何图是识别难点，重点核这些）");
-    println!("  自造 id（不在树中）{not_in_tree}");
-    println!("  平均耗时 {avg_lat:.2}s / 图，合计 tokens {total_tok}");
+    println!("  图片 {}（成功 {img_ok} / 失败 {img_fail}）", results.len());
+    println!("  共识别出 {total_q} 道题");
+    println!("  含图形题 {has_fig} / 自造 id（不在树中）{not_in_tree}");
+    println!("  合计 tokens {total_tok}");
     println!("  原始结果：{}", jsonl_path.display());
     println!("  人工评分表：{}", review_path.display());
-    println!("\n下一步：打开 review.csv 逐行填「读题正确」「归类正确」两列，存盘后执行 score --review <review.csv>");
+    println!("\n下一步：打开 review.csv 逐行（每行一题）填「读题正确」「归类正确」，存盘后 score --review <review.csv>");
     Ok(())
 }
 
@@ -661,10 +701,9 @@ fn parse_f(s: &str) -> Option<f64> {
     }
 }
 
-/// score：读人工填好的 review.csv，算读题准确率 + 归类准确率 + 置信度校准。
+/// score：读人工填好的 review.csv（每行一题），算读题 / 归类准确率 + 置信度校准。
 fn cmd_score(review: &str) -> Result<(), String> {
     let mut rdr = csv::Reader::from_path(review).map_err(|e| format!("读不到 {review}：{e}"))?;
-    // 按表头名找列号（不写死列序，容忍人工调列）。
     let headers = rdr.headers().map_err(|e| format!("读表头失败：{e}"))?.clone();
     let col = |name: &str| headers.iter().position(|h| h == name);
     let read_i = col("读题正确(1=对/0.5=部分/0=错)");
@@ -704,23 +743,23 @@ fn cmd_score(review: &str) -> Result<(), String> {
 
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
     println!("== 识别率 spike 评分：{review} ==");
-    println!("  图片总数 {total}");
+    println!("  题目总数 {total}");
     if read_scores.is_empty() {
         println!("  读题准确率：无数据（请先填「读题正确」列）");
     } else {
-        println!("  读题准确率：{:.1}%（已评 {} 张，0.5 计部分正确）", mean(&read_scores) * 100.0, read_scores.len());
+        println!("  读题准确率：{:.1}%（已评 {} 题，0.5 计部分正确）", mean(&read_scores) * 100.0, read_scores.len());
     }
     if cls_scores.is_empty() {
         println!("  归类准确率：无数据（请先填「归类正确」列）");
     } else {
-        println!("  归类准确率：{:.1}%（已评 {} 张）", mean(&cls_scores) * 100.0, cls_scores.len());
+        println!("  归类准确率：{:.1}%（已评 {} 题）", mean(&cls_scores) * 100.0, cls_scores.len());
     }
     if !conf_right.is_empty() || !conf_wrong.is_empty() {
         let show = |v: &[f64]| if v.is_empty() { "无".to_string() } else { format!("{:.2}", mean(v)) };
         println!("  置信度校准参考：归类对时均置信度 {}，归类错时 {}", show(&conf_right), show(&conf_wrong));
     }
     if ungraded > 0 {
-        println!("  还有 {ungraded} 张两列都没填，未计入。");
+        println!("  还有 {ungraded} 题两列都没填，未计入。");
     }
     println!("\n  通过线由 spike 结果与需求方拍定后再判定是否进入 MVP 开发。");
     Ok(())
@@ -747,7 +786,7 @@ fn main() {
             (Some("--review"), Some(p)) => cmd_score(p),
             _ => Err("用法：score --review <review.csv>".to_string()),
         },
-        "" => Err("用法：recognize-rs <check | run --image 图 | run --dir 目录 | score>".to_string()),
+        "" => Err("用法：recognize-rs <check | run --image 图 | run --dir 目录 | score --review csv>".to_string()),
         other => Err(format!("未知子命令：{other}")),
     };
 
